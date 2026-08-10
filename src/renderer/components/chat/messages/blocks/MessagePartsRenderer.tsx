@@ -20,6 +20,7 @@ import { ErrorBoundary } from '@renderer/components/ErrorBoundary'
 import { useIsActiveTurnTarget } from '@renderer/hooks/useIsActiveTurnTarget'
 import { useTopicStreamStatus } from '@renderer/hooks/useTopicStreamStatus'
 import { FILE_TYPE } from '@renderer/types/file'
+import type { Citation } from '@renderer/types/message'
 import {
   type MessageCitations,
   resolveCitationMarkerParts,
@@ -28,10 +29,15 @@ import {
 } from '@renderer/utils/message/citations'
 import { readComposerFileTokenIdSuffix } from '@renderer/utils/message/composerFileTokenSource'
 import { getDisplayComposerTokens } from '@renderer/utils/message/composerTokens'
-import { convertReferencesToCitationReferences, convertReferencesToCitations } from '@renderer/utils/partsToBlocks'
+import {
+  type CitationReferenceView,
+  convertReferencesToCitationReferences,
+  convertReferencesToCitations
+} from '@renderer/utils/partsToBlocks'
+import type { CompactionAnchorData } from '@shared/ai/compaction'
 import { classifyTurn } from '@shared/ai/transport'
 import type { CherryMessagePart, ContentReference, ReasoningUIPart } from '@shared/data/types/message'
-import type { CherryProviderMetadata, ComposerMessageToken } from '@shared/data/types/uiParts'
+import type { CherryProviderMetadata, ComposerMessageSnapshot, ComposerMessageToken } from '@shared/data/types/uiParts'
 import { readCherryMeta } from '@shared/data/types/uiParts'
 import { getToolName, isDataUIPart, isFileUIPart, isToolUIPart } from 'ai'
 import { AnimatePresence, motion, type Variants } from 'motion/react'
@@ -68,12 +74,21 @@ import {
 import { useMessageParts, useTranslationOverlayEntry } from './MessagePartsContext'
 import MessageProcessGroup from './MessageProcessGroup'
 import PlaceholderBlock, { type PlaceholderStatus } from './PlaceholderBlock'
-import { useRequestScrollFollowRecovery } from './ScrollOwnershipContext'
+import RetryStatusBlock from './RetryStatusBlock'
 import ThinkingBlock, { ThinkingBlockContent } from './ThinkingBlock'
 import { ToolBlockGroup, ToolBlockGroupContent } from './ToolBlockGroup'
 import TranslationBlock from './TranslationBlock'
 
 const logger = loggerService.withContext('MessagePartsRenderer')
+
+// The same references array must convert to the same citation array identities
+// across renders: a fresh array here cascades into ChatMarkdown's components
+// map and forces Streamdown to re-render (and re-animate) every markdown block
+// on each streaming tick.
+const referenceCitationsCache = new WeakMap<
+  ContentReference[],
+  { citations: Citation[]; citationReferences?: CitationReferenceView[] }
+>()
 
 // ============================================================================
 // Animation shared by message block renderers.
@@ -116,7 +131,8 @@ const AnimatedBlockWrapper: React.FC<{
   enableAnimation: boolean
   className?: string
   animation?: 'slide' | 'fade'
-}> = ({ className, children, enableAnimation, animation = 'slide' }) => {
+  messagePartId?: string
+}> = ({ className, children, enableAnimation, animation = 'slide', messagePartId }) => {
   const wrapperClassName = ['block-wrapper', className].filter(Boolean).join(' ')
 
   // Latch: Once a block has entered the motion.div branch during streaming (enableAnimation === true),
@@ -133,7 +149,7 @@ const AnimatedBlockWrapper: React.FC<{
 
   if (!hasEverAnimated) {
     return (
-      <div className={wrapperClassName}>
+      <div className={wrapperClassName} data-message-part-id={messagePartId}>
         <ErrorBoundary fallbackComponent={BlockErrorFallback}>{children}</ErrorBoundary>
       </div>
     )
@@ -142,6 +158,7 @@ const AnimatedBlockWrapper: React.FC<{
   return (
     <motion.div
       className={wrapperClassName}
+      data-message-part-id={messagePartId}
       variants={variants}
       initial={enableAnimation ? 'hidden' : false}
       animate={enableAnimation ? 'visible' : 'static'}>
@@ -268,12 +285,13 @@ function getComposerTokenDisplayText(
   part: CherryMessagePart,
   message: MessageListItem,
   partId: string,
-  expandedTextPartIds: ReadonlySet<string>
+  expandedTextPartIds: ReadonlySet<string>,
+  composer: ComposerMessageSnapshot
 ): string {
   const text = (part as { text?: string }).text ?? ''
   if (message.role !== 'user' || expandedTextPartIds.has(partId)) return text
 
-  return buildUserMessagePreview(text).content
+  return buildUserMessagePreview(text, composer).content
 }
 
 function getVisibleComposerFileTokens(
@@ -286,7 +304,7 @@ function getVisibleComposerFileTokens(
     const composer = getCherryMeta(part)?.composer
     if (!composer) return []
     const partId = `${message.id}-part-${index}`
-    const text = getComposerTokenDisplayText(part, message, partId, expandedTextPartIds)
+    const text = getComposerTokenDisplayText(part, message, partId, expandedTextPartIds, composer)
 
     return getDisplayComposerTokens(composer).flatMap((token) => {
       if (token.kind !== 'file' || !isComposerTokenVisibleInText(token, text)) return []
@@ -521,7 +539,7 @@ function renderPart(
     }
 
     case 'data-compaction-anchor':
-      return <CompactionAnchorBlock key={partId} />
+      return <CompactionAnchorBlock key={partId} data={(part as { data?: CompactionAnchorData }).data} />
 
     case 'data-conversation-reset':
       return <ConversationResetBlock key={partId} />
@@ -540,20 +558,23 @@ function renderPart(
 
     case 'text': {
       const cherryMeta = getCherryMeta(part)
-      const citations = cherryMeta?.references
-        ? convertReferencesToCitations(cherryMeta.references as ContentReference[])
-        : []
-      const citationReferences = cherryMeta?.references
-        ? convertReferencesToCitationReferences(cherryMeta.references as ContentReference[], partId)
-        : undefined
+      const references = cherryMeta?.references as ContentReference[] | undefined
+      let converted = references ? referenceCitationsCache.get(references) : undefined
+      if (references && !converted) {
+        converted = {
+          citations: convertReferencesToCitations(references),
+          citationReferences: convertReferencesToCitationReferences(references, partId)
+        }
+        referenceCitationsCache.set(references, converted)
+      }
       return (
         <MainTextBlock
           key={partId}
           id={partId}
           content={part.text || ''}
           isStreaming={isStreaming}
-          citations={citations}
-          citationReferences={citationReferences}
+          citations={converted?.citations}
+          citationReferences={converted?.citationReferences}
           inlineHtmlPreviewMode={inlineHtmlPreviewMode}
           messageCitations={message.role === 'assistant' ? options?.messageCitations : undefined}
           toolCitationProjection={options?.citationProjectionByPart?.get(part)}
@@ -597,6 +618,12 @@ function renderPart(
       const rawData = 'data' in part ? part.data : undefined
       if (!rawData) return null
       return <MessageVideo key={partId} url={rawData.url} filePath={rawData.filePath} />
+    }
+
+    case 'data-retry': {
+      const rawData = 'data' in part ? part.data : undefined
+      if (!rawData) return null
+      return <RetryStatusBlock key={partId} data={rawData} />
     }
 
     case 'data-agent-task-event':
@@ -845,7 +872,11 @@ function renderGroupedEntry(
         : undefined
 
   return (
-    <AnimatedBlockWrapper key={partId} enableAnimation={enableAnimation} className={wrapperClassName}>
+    <AnimatedBlockWrapper
+      key={partId}
+      enableAnimation={enableAnimation}
+      className={wrapperClassName}
+      messagePartId={entry.part.type === 'text' ? partId : undefined}>
       {rendered}
     </AnimatedBlockWrapper>
   )
@@ -1328,15 +1359,9 @@ const MessagePartsRendererContent = React.memo(function MessagePartsRendererCont
   message,
   messageParts
 }: MessagePartsRendererContentProps) {
-  const requestFollowRecovery = useRequestScrollFollowRecovery()
   // Inline ephemeral status for the live turn (e.g. agent api-retry). Only the active-turn message
   // renders it; the node itself renders nothing when there is no such state.
   const activeTurnStatus = useMessageListActiveTurnStatus()
-  const wasActiveTurnProcessingRef = React.useRef(isActiveTurnProcessing)
-  React.useEffect(() => {
-    if (wasActiveTurnProcessingRef.current && !isActiveTurnProcessing) requestFollowRecovery()
-    wasActiveTurnProcessingRef.current = isActiveTurnProcessing
-  }, [isActiveTurnProcessing, requestFollowRecovery])
   const [expandedTextPartIds, setExpandedTextPartIds] = React.useState<ReadonlySet<string>>(() => new Set())
   const [unsettledTextPlayoutPartIds, setUnsettledTextPlayoutPartIds] = React.useState<ReadonlySet<string>>(
     () => new Set()

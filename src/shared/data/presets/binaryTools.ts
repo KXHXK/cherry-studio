@@ -134,19 +134,11 @@ export const PRESETS_BINARY_TOOLS: BinaryToolPreset[] = [
     homepage: 'https://ntn.dev'
   },
   {
-    name: 'pi',
-    displayName: 'Pi',
-    tool: 'pi',
-    repoUrl: 'https://github.com/earendil-works/pi',
-    homepage: 'https://pi.dev'
-  },
-  {
     name: BABELDOC_TOOL_NAME,
     displayName: 'BabelDOC Stream',
     tool: 'pipx:babeldoc-stream',
     repoUrl: 'https://github.com/eeee0717/BabelDOC',
     homepage: 'https://pypi.org/project/babeldoc-stream/'
   }
-  // CLI code tools (claude, codex, opencode, openclaw) are managed
-  // in the Code CLI page instead of here.
+  // Managed Code CLIs are listed in codeCliTools.ts instead of here.
 ]

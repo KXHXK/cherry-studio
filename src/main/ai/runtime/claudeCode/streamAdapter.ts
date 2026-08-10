@@ -478,6 +478,7 @@ export class ClaudeCodeStreamAdapter {
   private readonly flowContexts: FlowContext[] = []
   /** `system/init` can arrive before the first turn opens, so its metadata chunk waits for one. */
   private pendingInit?: Extract<SDKMessage, { subtype: 'init' }>
+  private turnHasActivity = false
 
   constructor(options: ClaudeCodeStreamAdapterOptions) {
     this.modelId = options.modelId
@@ -497,7 +498,7 @@ export class ClaudeCodeStreamAdapter {
    */
   private createTurnContext(sink = this.sink): StreamContext {
     return {
-      sink,
+      sink: this.createActivityTrackingSink(sink),
       options: this.streamOptions,
       toolStates: new Map(),
       activeTaskTools: new Map(),
@@ -519,13 +520,27 @@ export class ClaudeCodeStreamAdapter {
     }
   }
 
+  private createActivityTrackingSink(sink: StreamSink): StreamSink {
+    return {
+      enqueue: (chunk) => {
+        if (chunk.type !== 'message-metadata') this.turnHasActivity = true
+        sink.enqueue(chunk)
+      }
+    }
+  }
+
   /** Whether a turn is open. Turn-scoped session status (an API retry) is gated on this. */
   get isTurnActive(): boolean {
     return this.turnActive
   }
 
+  get hasTurnActivity(): boolean {
+    return this.turnHasActivity
+  }
+
   /** Opens a turn on the session-scoped adapter, discarding the previous turn's state wholesale. */
   beginTurn(): void {
+    this.turnHasActivity = false
     this.ctx = this.createTurnContext()
     this.turnActive = true
     this.autonomousTurn = false
@@ -656,7 +671,7 @@ export class ClaudeCodeStreamAdapter {
 
   private detachFlowContexts(): void {
     for (const flow of this.flowContexts) {
-      flow.stream.sink = this.createFlowSink(flow.rootToolCallId)
+      flow.stream.sink = this.createActivityTrackingSink(this.createFlowSink(flow.rootToolCallId))
     }
   }
 
@@ -737,7 +752,9 @@ export class ClaudeCodeStreamAdapter {
     ctx: StreamContext
   ): void {
     const toolId = toolBlock.id
-    const toolName = toolBlock.name
+    // Anthropic-compatible relays may open a tool_use block before the name is known;
+    // `handleToolUse` fills it in from the completed assistant message.
+    const toolName = toolBlock.name ?? ''
     const toolMetadata = this.getToolUseMetadata(toolBlock)
 
     this.closeActiveTextPart(ctx)
@@ -910,7 +927,9 @@ export class ClaudeCodeStreamAdapter {
       const effectiveInput = accumulatedInput || state.lastSerializedInput || ''
       state.lastSerializedInput = effectiveInput
 
-      if (!state.callEmitted) {
+      // A nameless block is still waiting for the name the completed assistant message carries;
+      // emitting now would freeze the call under an unusable name.
+      if (!state.callEmitted && state.name) {
         this.emitToolInputAvailable(toolId, state, ctx)
       }
     }
@@ -964,10 +983,12 @@ export class ClaudeCodeStreamAdapter {
   ): void {
     const toolId = tool.id
     let state = ctx.toolStates.get(toolId)
+    // The name may be missing here too, in which case the streamed one (if any) stands.
+    const toolName = tool.name ?? state?.name ?? ''
     if (!state) {
-      const currentParentId = getToolParentId(tool.name, sdkParentToolUseId, this.getFallbackParentId(ctx))
+      const currentParentId = getToolParentId(toolName, sdkParentToolUseId, this.getFallbackParentId(ctx))
       state = {
-        name: tool.name,
+        name: toolName,
         inputStarted: false,
         inputClosed: false,
         callEmitted: false,
@@ -978,7 +999,7 @@ export class ClaudeCodeStreamAdapter {
     } else if (!state.parentToolCallId && sdkParentToolUseId) {
       state.parentToolCallId = sdkParentToolUseId
     }
-    state.name = tool.name
+    state.name = toolName
     this.mergeToolMetadata(state, this.getToolUseMetadata(tool))
     this.mergeToolDisplayMetadata(state)
 
@@ -986,13 +1007,13 @@ export class ClaudeCodeStreamAdapter {
       ctx.sink.enqueue({
         type: 'tool-input-start',
         toolCallId: toolId,
-        toolName: tool.name,
+        toolName,
         providerExecuted: true,
         dynamic: true,
         title: this.getToolTitle(state),
         providerMetadata: this.buildToolProviderMetadata(state)
       })
-      if (isSubagentToolName(tool.name)) ctx.activeTaskTools.set(toolId, { startTime: Date.now() })
+      if (isSubagentToolName(toolName)) ctx.activeTaskTools.set(toolId, { startTime: Date.now() })
       state.inputStarted = true
     }
 
@@ -1014,6 +1035,11 @@ export class ClaudeCodeStreamAdapter {
         ctx.sink.enqueue({ type: 'tool-input-delta', toolCallId: toolId, inputTextDelta: deltaPayload })
       }
       state.lastSerializedInput = serializedInput
+    }
+
+    // The content block closed before the name was known, so its emission was deferred to here.
+    if (state.inputClosed && !state.callEmitted) {
+      this.emitToolInputAvailable(toolId, state, ctx)
     }
   }
 
@@ -1069,7 +1095,7 @@ export class ClaudeCodeStreamAdapter {
     if (ctx.toolResultsEmitted.has(result.tool_use_id)) return
 
     let state = ctx.toolStates.get(result.tool_use_id)
-    const toolName = state?.name ?? this.getToolNameFromResultType(result.type) ?? UNKNOWN_TOOL_NAME
+    const toolName = state?.name || this.getToolNameFromResultType(result.type) || UNKNOWN_TOOL_NAME
 
     if (!state) {
       const resolvedParentId = getToolParentId(toolName, sdkParentToolUseId, this.getFallbackParentId(ctx))
@@ -1426,6 +1452,8 @@ export class ClaudeCodeStreamAdapter {
   private handleCompactBoundarySystemMessage(message: SDKCompactBoundaryMessage): void {
     const metadata = message.compact_metadata
     const anchor: AgentSessionCompactionAnchorData = {
+      status: 'done',
+      phase: 'agent-session',
       trigger: metadata.trigger,
       completedAt: new Date().toISOString(),
       preTokens: metadata.pre_tokens
@@ -1725,7 +1753,7 @@ export class ClaudeCodeStreamAdapter {
       content: hasMcpNonTextContent(rawContent) ? normalizeMcpToolContent(rawContent) : result,
       metadata: {
         type: 'mcp',
-        ...(state.displayName ? { name: state.displayName } : {}),
+        name: state.displayName ?? state.name,
         ...(state.description ? { description: state.description } : {}),
         serverName: state.serverName ?? 'MCP',
         serverId: state.serverId ?? state.serverName ?? 'unknown'
@@ -1821,7 +1849,8 @@ export class ClaudeCodeStreamAdapter {
     ctx.sink.enqueue({
       type: 'tool-input-available',
       toolCallId: toolId,
-      toolName: state.name,
+      // Last resort: the name never arrived, so the call is emitted under the placeholder.
+      toolName: state.name || UNKNOWN_TOOL_NAME,
       input: this.deserializeToolInput(serializedInput),
       providerExecuted: true,
       dynamic: true,
