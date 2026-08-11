@@ -5981,10 +5981,10 @@
       },
       "feedback": {
         "agent": {
-          "description": "创建独立的 Cherry Assistant 会话，并预先选中反馈 Skill。",
-          "title": "问 Cherry Assistant"
+          "description": "创建独立的 Cherry 小助手会话，并预先选中反馈 Skill。",
+          "title": "问 Cherry 小助手"
         },
-        "agent_error": "无法为反馈打开 Cherry Assistant，请重试。",
+        "agent_error": "无法为反馈打开 Cherry 小助手，请重试。",
         "button": "反馈",
         "diagnostics": {
           "description": "确认最近的诊断信息后，一键匿名上传。",
