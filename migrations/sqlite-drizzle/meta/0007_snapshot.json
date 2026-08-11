@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "95aae1dc-8dc7-4b0a-bdfa-f481f6e247be",
+  "id": "572b2f89-617e-4cfd-a5b4-c8fd239c56d5",
   "prevId": "749b7a35-ec67-4508-bccf-495941a94a9d",
   "tables": {
     "agent": {
@@ -2420,7 +2420,7 @@
         },
         "thfr_unique_idx": {
           "name": "thfr_unique_idx",
-          "columns": ["file_entry_id", "source_id", "role"],
+          "columns": ["source_id", "role"],
           "isUnique": true
         }
       },
